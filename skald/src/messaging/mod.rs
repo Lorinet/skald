@@ -58,6 +58,8 @@ pub struct ResponseMessage {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RegisterServiceMessage {
     pub name: String,
+    pub token: Option<String>,
+    pub max_workers: Option<usize>,
 }
 
 /// A message to submit a saga definition for execution.

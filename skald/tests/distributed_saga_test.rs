@@ -80,6 +80,7 @@ async fn start_service_node(name: String, skald_addr: SocketAddr, log: SharedLog
     let name_clone_s3_comp = name.clone();
 
     ServiceBuilder::new(&name, transport).await?
+        .connect().await?
         .on_invoke("Service2.s2.exec", move |req: Service2ExecuteRequest| {
             let log = log_clone1.clone();
             let name = name_clone1.clone();
@@ -175,7 +176,7 @@ async fn test_central_orchestration_with_client_handlers() -> Result<()> {
     // 1. Start Skald Server
     let skald_port = 9093; // Use a different port
     let skald_addr: SocketAddr = format!("127.0.0.1:{}", skald_port).parse()?;
-    let skald_server = Arc::new(SkaldServer::new());
+    let skald_server = Arc::new(SkaldServer::new(vec![]));
 
     let server_clone = skald_server.clone();
     tokio::spawn(async move {

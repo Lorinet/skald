@@ -19,4 +19,3 @@ skald_derive = { path = "../skald_derive" }
 
 [dev-dependencies]
 tokio = { version = "1.44.2", features = ["full", "test-util"] }
-

@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 use async_trait::async_trait;
 use uuid::Uuid;
+use std::env;
 
 // --- Client-side Handlers ---
 
@@ -113,8 +114,16 @@ impl<T: Transport> SkaldClient<T> {
         self.transport.send(&serialize(&envelope)?).await
     }
 
-    pub async fn register_service(&mut self, name: &str) -> Result<()> {
-        let msg = SkaldMessage::RegisterService(RegisterServiceMessage { name: name.to_string() });
+    // Made private to enforce usage via ServiceBuilder
+    async fn register_service(&mut self, name: &str, max_workers: Option<usize>) -> Result<()> {
+        // Check for token in environment variable
+        let token = env::var("SKALD_SERVICE_TOKEN").ok();
+
+        let msg = SkaldMessage::RegisterService(RegisterServiceMessage {
+            name: name.to_string(),
+            token,
+            max_workers,
+        });
         self.transport.send(&serialize(&msg)?).await
     }
 
@@ -125,7 +134,8 @@ impl<T: Transport> SkaldClient<T> {
 }
 
 impl<T: Transport + Clone + Send + 'static> SkaldClient<T> {
-    pub fn on<P, F, Fut>(&mut self, topic: &str, handler: F)
+    // Made private to enforce usage via ServiceBuilder
+    fn on<P, F, Fut>(&mut self, topic: &str, handler: F)
     where
         P: DeserializeOwned + Send + Sync + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
@@ -139,7 +149,8 @@ impl<T: Transport + Clone + Send + 'static> SkaldClient<T> {
         self.event_handlers.insert(topic.to_string(), erased_handler);
     }
 
-    pub fn on_invoke<P, R, E, F, Fut>(&mut self, topic: &str, handler: F)
+    // Made private to enforce usage via ServiceBuilder
+    fn on_invoke<P, R, E, F, Fut>(&mut self, topic: &str, handler: F)
     where
         P: DeserializeOwned + Send + Sync + 'static,
         R: Serialize + Send + Sync + 'static,
@@ -251,16 +262,30 @@ impl<T: Transport + Clone + Send + 'static> SkaldClient<T> {
 pub struct ServiceBuilder<T: Transport> {
     name: String,
     client: Option<SkaldClient<T>>,
+    max_workers: Option<usize>,
 }
 
 impl<T: Transport + Clone + Send + 'static> ServiceBuilder<T> {
     pub async fn new(name: &str, transport: T) -> Result<Self> {
-        let mut client = SkaldClient::new(transport);
-        client.register_service(name).await?;
+        let client = SkaldClient::new(transport);
         Ok(Self {
             name: name.to_string(),
             client: Some(client),
+            max_workers: None,
         })
+    }
+
+    pub fn max_workers(mut self, limit: usize) -> Self {
+        self.max_workers = Some(limit);
+        self
+    }
+
+    // This is the new method to actually register
+    pub async fn connect(mut self) -> Result<Self> {
+        if let Some(client) = &mut self.client {
+            client.register_service(&self.name, self.max_workers).await?;
+        }
+        Ok(self)
     }
 
     pub fn on_event<E, F, Fut>(mut self, topic: &str, handler: F) -> Self
@@ -298,5 +323,9 @@ impl<T: Transport + Clone + Send + 'static> ServiceBuilder<T> {
                 }
             });
         }
+    }
+
+    pub fn build_client(self) -> SkaldClient<T> {
+        self.client.unwrap()
     }
 }

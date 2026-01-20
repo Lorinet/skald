@@ -1,4 +1,4 @@
-use skald::client::SkaldClient;
+use skald::client::{SkaldClient, ServiceBuilder};
 use skald::server::SkaldServer;
 use skald::transport::{TcpTransport, TcpTransportListener};
 use anyhow::Result;
@@ -18,7 +18,7 @@ async fn test_basic_message_passing() -> Result<()> {
 
     // 1. Start Skald Server
     let addr: SocketAddr = "127.0.0.1:9100".parse()?;
-    let server = Arc::new(SkaldServer::new());
+    let server = Arc::new(SkaldServer::new(vec![]));
     let server_clone = server.clone();
     tokio::spawn(async move {
         let listener = TcpTransportListener::bind(addr).await.unwrap();
@@ -28,21 +28,19 @@ async fn test_basic_message_passing() -> Result<()> {
 
     // 2. Start a Listener Service
     let listener_transport = TcpTransport::connect(addr).await?;
-    let mut listener_client = SkaldClient::new(listener_transport);
-    listener_client.register_service("ListenerService").await?;
-
     let received_clone = received_messages.clone();
-    listener_client.on("greetings", move |payload: GreetingEvent| {
-        let messages = received_clone.clone();
-        async move {
-            messages.lock().unwrap().push(payload.message);
-            Ok(())
-        }
-    });
 
-    tokio::spawn(async move {
-        listener_client.listen().await.unwrap();
-    });
+    ServiceBuilder::new("ListenerService", listener_transport).await?
+        .connect().await?
+        .on_event("greetings", move |payload: GreetingEvent| {
+            let messages = received_clone.clone();
+            async move {
+                messages.lock().unwrap().push(payload.message);
+                Ok(())
+            }
+        })
+        .start();
+
     sleep(Duration::from_millis(50)).await;
 
     // 3. Start a Sender Client and Send a Message

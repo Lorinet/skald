@@ -1,4 +1,4 @@
-use skald::client::SkaldClient;
+use skald::client::{SkaldClient, ServiceBuilder};
 use skald::server::SkaldServer;
 use skald::transport::{TcpTransport, TcpTransportListener};
 use anyhow::Result;
@@ -27,7 +27,7 @@ struct MathError {
 async fn test_durable_execution() -> Result<()> {
     // 1. Start Skald Server
     let addr: SocketAddr = "127.0.0.1:9101".parse()?;
-    let server = Arc::new(SkaldServer::new());
+    let server = Arc::new(SkaldServer::new(vec![]));
     let server_clone = server.clone();
     tokio::spawn(async move {
         let listener = TcpTransportListener::bind(addr).await.unwrap();
@@ -37,17 +37,15 @@ async fn test_durable_execution() -> Result<()> {
 
     // 2. Start the Calculator Service
     let calc_transport = TcpTransport::connect(addr).await?;
-    let mut calc_client = SkaldClient::new(calc_transport);
-    calc_client.register_service("CalculatorService").await?;
 
-    calc_client.on_invoke("CalculatorService.add", |req: AddRequest| async move {
-        let sum = req.a + req.b;
-        Ok::<_, MathError>(AddResponse { sum })
-    });
+    ServiceBuilder::new("CalculatorService", calc_transport).await?
+        .connect().await?
+        .on_invoke("CalculatorService.add", |req: AddRequest| async move {
+            let sum = req.a + req.b;
+            Ok::<_, MathError>(AddResponse { sum })
+        })
+        .start();
 
-    tokio::spawn(async move {
-        calc_client.listen().await.unwrap();
-    });
     sleep(Duration::from_millis(50)).await;
 
     // 3. Start the Requester Client and Invoke the Method

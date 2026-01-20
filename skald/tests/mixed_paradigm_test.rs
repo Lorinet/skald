@@ -71,6 +71,7 @@ type SharedLog = Arc<Mutex<Vec<String>>>;
 async fn start_user_service(skald_addr: SocketAddr, log: SharedLog) -> Result<()> {
     let transport = TcpTransport::connect(skald_addr).await?;
     ServiceBuilder::new("UserService", transport).await?
+        .connect().await?
         .on_event("user.created", move |event: UserCreatedEvent| {
             let log = log.clone();
             async move {
@@ -88,6 +89,7 @@ async fn start_order_service(skald_addr: SocketAddr, log: SharedLog) -> Result<(
     let transport = TcpTransport::connect(skald_addr).await?;
 
     ServiceBuilder::new("OrderService", transport).await?
+        .connect().await?
         .on_invoke("OrderService.create", move |req: CreateOrderRequest| {
             let log = log_create.clone();
             async move {
@@ -116,6 +118,7 @@ async fn start_payment_service(skald_addr: SocketAddr, log: SharedLog) -> Result
     let transport = TcpTransport::connect(skald_addr).await?;
 
     ServiceBuilder::new("PaymentService", transport).await?
+        .connect().await?
         .on_invoke("PaymentService.process", move |req: ProcessPaymentRequest| {
             let log = log_process.clone();
             async move {
@@ -146,7 +149,7 @@ async fn test_mixed_paradigm_scenario() -> Result<()> {
     // 1. Start Skald Server
     let skald_port = 9102;
     let skald_addr: SocketAddr = format!("127.0.0.1:{}", skald_port).parse()?;
-    let server = Arc::new(SkaldServer::new());
+    let server = Arc::new(SkaldServer::new(vec![]));
     let server_clone = server.clone();
     tokio::spawn(async move {
         let listener = TcpTransportListener::bind(skald_addr).await.unwrap();

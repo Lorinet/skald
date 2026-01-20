@@ -1,6 +1,6 @@
 use skald::transport::{TcpTransportListener, TcpTransport};
 use skald::server::SkaldServer;
-use skald::client::SkaldClient;
+use skald::client::{SkaldClient, ServiceBuilder};
 use skald::messaging::Message;
 use skald::saga::{SagaBuilder, SagaStep, SagaState};
 use async_trait::async_trait;
@@ -27,7 +27,7 @@ impl Message for TestEvent {
 #[tokio::test]
 async fn test_tcp_transport_and_messaging() -> Result<()> {
     let addr: SocketAddr = "127.0.0.1:8081".parse()?;
-    let server = Arc::new(SkaldServer::new());
+    let server = Arc::new(SkaldServer::new(vec![]));
     let received_events = Arc::new(Mutex::new(Vec::<TestEvent>::new()));
 
     // 1. Start Server
@@ -41,19 +41,37 @@ async fn test_tcp_transport_and_messaging() -> Result<()> {
     // 2. Start a Listener Client
     let received_clone = received_events.clone();
     let listener_transport = TcpTransport::connect(addr).await?;
-    let mut listener_client = SkaldClient::new(listener_transport);
-    listener_client.on("test.topic", move |event: TestEvent| {
-        let events = received_clone.clone();
-        async move {
-            events.lock().unwrap().push(event);
-            Ok(())
-        }
-    });
-    tokio::spawn(async move { listener_client.listen().await.unwrap(); });
+
+    // Use ServiceBuilder to register and listen
+    ServiceBuilder::new("ListenerService", listener_transport).await?
+        .connect().await?
+        .on_event("test.topic", move |event: TestEvent| {
+            let events = received_clone.clone();
+            async move {
+                events.lock().unwrap().push(event);
+                Ok(())
+            }
+        })
+        .start();
+
     sleep(Duration::from_millis(50)).await;
 
     // 3. Start a Sender Client and Send an Event
     let sender_transport = TcpTransport::connect(addr).await?;
+    // We can still use SkaldClient directly for sending if we want, but let's use ServiceBuilder for consistency
+    // Or just use the client from the builder if we exposed it, but start() consumes it.
+    // Since we made register_service private, we must use ServiceBuilder to register.
+    // But send_event is public.
+    // We can build a client without starting the listener loop if we just want to send.
+    // But ServiceBuilder::new doesn't return the client directly anymore in a usable state without connect.
+    // Wait, ServiceBuilder::new returns a builder. We can call connect() then extract client?
+    // No, we don't expose client extraction in public API.
+    // But we can use `SkaldClient::new` directly? No, `register_service` is private.
+    // If we don't register, can we send events? Yes, `send_event` is public.
+    // But the server might expect registration? The server doesn't enforce registration for sending events currently,
+    // only for routing invocations TO the service.
+    // So `SkaldClient::new` + `send_event` should work for anonymous senders.
+
     let mut sender_client = SkaldClient::new(sender_transport);
     let event_to_send = TestEvent { id: 1, content: "Hello World".to_string() };
     sender_client.send_event(&event_to_send).await?;
