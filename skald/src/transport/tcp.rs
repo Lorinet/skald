@@ -36,6 +36,7 @@ impl Transport for TcpTransport {
         let mut writer = self.writer.lock().await;
         writer.write_u32(len).await?;
         writer.write_all(data).await?;
+        writer.flush().await?;
         Ok(())
     }
 

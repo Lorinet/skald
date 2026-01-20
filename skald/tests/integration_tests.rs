@@ -1,8 +1,7 @@
-use skald::transport::{TcpTransportListener, TcpTransport, Transport, TransportListener};
+use skald::transport::{TcpTransportListener, TcpTransport};
 use skald::server::SkaldServer;
 use skald::client::SkaldClient;
-use skald::messaging::{Message, GenericMessage};
-use skald::handler::EventHandler;
+use skald::messaging::Message;
 use skald::saga::{SagaBuilder, SagaStep, SagaState};
 use async_trait::async_trait;
 use anyhow::Result;
@@ -10,8 +9,10 @@ use std::net::SocketAddr;
 use tokio::time::{sleep, Duration};
 use std::sync::{Arc, Mutex};
 use serde::{Serialize, Deserialize};
+use serde_json::Value;
+use std::collections::HashMap;
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 struct TestEvent {
     id: u32,
     content: String,
@@ -23,57 +24,45 @@ impl Message for TestEvent {
     }
 }
 
-struct TestHandler {
-    received: Arc<Mutex<Vec<TestEvent>>>,
-}
-
-#[async_trait]
-impl EventHandler for TestHandler {
-    async fn handle(&self, message: GenericMessage) -> Result<()> {
-        let event: TestEvent = skald::messaging::deserialize(&message.payload)?;
-        self.received.lock().unwrap().push(event);
-        Ok(())
-    }
-}
-
 #[tokio::test]
 async fn test_tcp_transport_and_messaging() -> Result<()> {
     let addr: SocketAddr = "127.0.0.1:8081".parse()?;
     let server = Arc::new(SkaldServer::new());
-    let received_events = Arc::new(Mutex::new(Vec::new()));
+    let received_events = Arc::new(Mutex::new(Vec::<TestEvent>::new()));
 
-    server.register_handler("test.topic".to_string(), TestHandler {
-        received: received_events.clone(),
-    }).await;
-
+    // 1. Start Server
     let server_clone = server.clone();
     tokio::spawn(async move {
         let listener = TcpTransportListener::bind(addr).await.unwrap();
         server_clone.listen(Box::new(listener)).await.unwrap();
     });
+    sleep(Duration::from_millis(50)).await;
 
-    // Give server time to start
-    sleep(Duration::from_millis(100)).await;
-
-    // Start processing loop
-    let server_clone_run = server.clone();
-    tokio::spawn(async move {
-        server_clone_run.run().await;
+    // 2. Start a Listener Client
+    let received_clone = received_events.clone();
+    let listener_transport = TcpTransport::connect(addr).await?;
+    let mut listener_client = SkaldClient::new(listener_transport);
+    listener_client.on("test.topic", move |event: TestEvent| {
+        let events = received_clone.clone();
+        async move {
+            events.lock().unwrap().push(event);
+            Ok(())
+        }
     });
+    tokio::spawn(async move { listener_client.listen().await.unwrap(); });
+    sleep(Duration::from_millis(50)).await;
 
-    let transport = TcpTransport::connect(addr).await?;
-    let mut client = SkaldClient::new(transport);
+    // 3. Start a Sender Client and Send an Event
+    let sender_transport = TcpTransport::connect(addr).await?;
+    let mut sender_client = SkaldClient::new(sender_transport);
+    let event_to_send = TestEvent { id: 1, content: "Hello World".to_string() };
+    sender_client.send_event(&event_to_send).await?;
 
-    let event = TestEvent { id: 1, content: "Hello World".to_string() };
-    client.send_event(&event).await?;
-
-    // Wait for processing
+    // 4. Wait and Verify
     sleep(Duration::from_millis(200)).await;
-
     let received = received_events.lock().unwrap();
     assert_eq!(received.len(), 1);
-    assert_eq!(received[0].id, 1);
-    assert_eq!(received[0].content, "Hello World");
+    assert_eq!(received[0], event_to_send);
 
     Ok(())
 }
@@ -83,7 +72,7 @@ struct MockStep {
     should_fail: bool,
     executed: Arc<Mutex<bool>>,
     compensated: Arc<Mutex<bool>>,
-    result_data: Option<Vec<u8>>,
+    result_data: Option<Value>,
 }
 
 #[async_trait]
@@ -92,15 +81,15 @@ impl SagaStep for MockStep {
         self.name.clone()
     }
 
-    async fn execute(&self) -> Result<Option<Vec<u8>>> {
+    async fn execute(&self, _context: &HashMap<String, Value>) -> Result<Value> {
         if self.should_fail {
             anyhow::bail!("Step failed intentionally");
         }
         *self.executed.lock().unwrap() = true;
-        Ok(self.result_data.clone())
+        Ok(self.result_data.clone().unwrap_or(Value::Null))
     }
 
-    async fn compensate(&self) -> Result<()> {
+    async fn compensate(&self, _context: &HashMap<String, Value>, _error: Option<&Value>) -> Result<()> {
         *self.compensated.lock().unwrap() = true;
         Ok(())
     }
@@ -116,7 +105,7 @@ async fn test_saga_success() -> Result<()> {
         should_fail: false,
         executed: executed1.clone(),
         compensated: Arc::new(Mutex::new(false)),
-        result_data: Some(vec![1, 2, 3]),
+        result_data: Some(serde_json::json!({"status": "ok"})),
     });
 
     let step2 = Box::new(MockStep {
@@ -208,11 +197,8 @@ async fn test_saga_state_inspection() -> Result<()> {
 
 #[tokio::test]
 async fn test_saga_step_result_passing() -> Result<()> {
-    // This test verifies that we can retrieve the result of a step if we were to inspect the state
-    // In a real scenario, subsequent steps might use this data, but here we just check it was returned.
-
     let executed1 = Arc::new(Mutex::new(false));
-    let expected_data = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    let expected_data = serde_json::json!({"key": "value"});
 
     let step1 = Box::new(MockStep {
         name: "step1".to_string(),
@@ -227,11 +213,6 @@ async fn test_saga_step_result_passing() -> Result<()> {
         .build();
 
     saga.execute().await?;
-
-    // We can't easily inspect the intermediate state of a completed saga with the current API
-    // unless we add a history feature, but we can verify the saga completed successfully.
-    // However, if we wanted to verify the result was captured, we'd need to expose the execution history.
-    // For now, we just ensure it runs.
 
     assert!(matches!(saga.get_state(), SagaState::Completed));
 

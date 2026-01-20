@@ -1,92 +1,167 @@
 use skald::transport::{TcpTransportListener, TcpTransport};
 use skald::server::SkaldServer;
-use skald::client::SkaldClient;
-use skald::messaging::{Message, serialize};
-use skald::saga::{SagaRecipe, RemoteStepDefinition};
+use skald::client::{SkaldClient, ServiceBuilder};
+use skald::saga::builder::{SagaDefinitionBuilder, MessageTemplateBuilder};
 use anyhow::Result;
 use std::net::SocketAddr;
 use tokio::time::{sleep, Duration};
 use std::sync::{Arc, Mutex};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
-// --- Events for Services ---
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct Service2Execute { id: u32 }
-impl Message for Service2Execute { fn topic(&self) -> String { "s2.exec".to_string() } }
+// --- Message Structs for Testing ---
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct Service2Compensate { id: u32 }
-impl Message for Service2Compensate { fn topic(&self) -> String { "s2.comp".to_string() } }
+struct Service2ExecuteRequest {
+    initial_id: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+struct Service2ExecuteResponse {
+    processed_id: u32,
+    order_id: String, // New field to pass to next step
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct Service3Execute { data: String }
-impl Message for Service3Execute { fn topic(&self) -> String { "s3.exec".to_string() } }
+struct Service2ExecuteError {
+    reason: String,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct Service3Compensate { data: String }
-impl Message for Service3Compensate { fn topic(&self) -> String { "s3.comp".to_string() } }
+struct Service2CompensateRequest {
+    order_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct Service3ExecuteRequest {
+    data: String,
+    received_order_id: String, // Expecting this from previous step
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+struct Service3ExecuteResponse {
+    status: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct Service3ExecuteError {
+    reason: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct Service3CompensateRequest {
+    data: String,
+    order_id: String, // For compensation, might need original order_id
+}
 
 // --- Shared Log ---
 type SharedLog = Arc<Mutex<Vec<String>>>;
 
 // --- Service Functions ---
 
-/// Simulates a microservice that connects to Skald, registers, and waits for commands.
+/// Simulates a microservice that connects to Skald, registers handlers, and listens.
 async fn start_service_node(name: String, skald_addr: SocketAddr, log: SharedLog) -> Result<()> {
     let transport = TcpTransport::connect(skald_addr).await?;
-    let mut client = SkaldClient::new(transport);
 
-    // Use the high-level API to register
-    client.register_service(&name).await?;
+    // Handler for s2.exec invocation
+    let log_clone1 = log.clone();
+    let name_clone1 = name.clone();
 
-    // Listen for commands from the orchestrator
-    let name_clone = name.clone();
-    tokio::spawn(async move {
-        loop {
-            match client.receive_message().await {
-                Ok(msg) => {
-                    let log_msg = format!("{}: Received {}", name_clone, msg.topic);
-                    println!("{}", log_msg);
-                    log.lock().unwrap().push(log_msg);
-                }
-                Err(_) => break, // Connection closed
+    // Handler for s2.comp invocation
+    let log_clone_s2_comp = log.clone();
+    let name_clone_s2_comp = name.clone();
+
+    // Handler for s3.exec invocation
+    let log_clone2 = log.clone();
+    let name_clone2 = name.clone();
+
+    // Handler for s3.comp invocation
+    let log_clone_s3_comp = log.clone();
+    let name_clone_s3_comp = name.clone();
+
+    ServiceBuilder::new(&name, transport).await?
+        .on_invoke("Service2.s2.exec", move |req: Service2ExecuteRequest| {
+            let log = log_clone1.clone();
+            let name = name_clone1.clone();
+            async move {
+                let order_id = format!("order-{}", req.initial_id);
+                let log_msg = format!("{}: Received s2.exec with initial_id {} -> returning order_id {}", name, req.initial_id, order_id);
+                println!("{}", log_msg);
+                log.lock().unwrap().push(log_msg);
+                Ok::<_, Service2ExecuteError>(Service2ExecuteResponse {
+                    processed_id: req.initial_id + 100,
+                    order_id,
+                })
             }
-        }
-    });
+        })
+        .on_invoke("Service2.s2.comp", move |req: Service2CompensateRequest| {
+            let log = log_clone_s2_comp.clone();
+            let name = name_clone_s2_comp.clone();
+            async move {
+                let log_msg = format!("{}: Compensating s2.comp for order_id {}", name, req.order_id);
+                println!("{}", log_msg);
+                log.lock().unwrap().push(log_msg);
+                Ok::<_, Service2ExecuteError>(Value::Null) // Compensation usually returns nothing specific
+            }
+        })
+        .on_invoke("Service3.s3.exec", move |req: Service3ExecuteRequest| {
+            let log = log_clone2.clone();
+            let name = name_clone2.clone();
+            async move {
+                let log_msg = format!("{}: Received s3.exec with data '{}' and order_id '{}'", name, req.data, req.received_order_id);
+                println!("{}", log_msg);
+                log.lock().unwrap().push(log_msg);
+                Ok::<_, Service3ExecuteError>(Service3ExecuteResponse { status: "processed".to_string() })
+            }
+        })
+        .on_invoke("Service3.s3.comp", move |req: Service3CompensateRequest| {
+            let log = log_clone_s3_comp.clone();
+            let name = name_clone_s3_comp.clone();
+            async move {
+                let log_msg = format!("{}: Compensating s3.comp for data '{}' and order_id '{}'", name, req.data, req.order_id);
+                println!("{}", log_msg);
+                log.lock().unwrap().push(log_msg);
+                Ok::<_, Service3ExecuteError>(Value::Null) // Compensation usually returns nothing specific
+            }
+        })
+        .start();
 
+    println!("{} started and registered", name);
     Ok(())
 }
 
-/// Simulates a client/service that triggers a complex business process.
+/// Simulates a client that triggers a saga.
 async fn trigger_saga(skald_addr: SocketAddr) -> Result<()> {
     let transport = TcpTransport::connect(skald_addr).await?;
     let mut client = SkaldClient::new(transport);
 
-    // Define the business process as a data-only recipe
-    let recipe = SagaRecipe {
-        steps: vec![
-            RemoteStepDefinition {
-                name: "Step1_Service2".to_string(),
-                service_name: "Service2".to_string(),
-                execute_topic: Service2Execute{id: 0}.topic(),
-                execute_payload: serialize(&Service2Execute { id: 101 })?,
-                compensate_topic: Service2Compensate{id: 0}.topic(),
-                compensate_payload: serialize(&Service2Compensate { id: 101 })?,
-            },
-            RemoteStepDefinition {
-                name: "Step2_Service3".to_string(),
-                service_name: "Service3".to_string(),
-                execute_topic: Service3Execute{data: "".to_string()}.topic(),
-                execute_payload: serialize(&Service3Execute { data: "Hello".to_string() })?,
-                compensate_topic: Service3Compensate{data: "".to_string()}.topic(),
-                compensate_payload: serialize(&Service3Compensate { data: "Undo".to_string() })?,
-            },
-        ],
-    };
+    let recipe = SagaDefinitionBuilder::new("DistributedTestSaga")
+        .step("Step1_Service2")
+            .service("Service2")
+            .execute("Service2.s2.exec", MessageTemplateBuilder::new()
+                .field("initial_id", 101)
+                .build())
+            .compensate("Service2.s2.comp", MessageTemplateBuilder::new()
+                .from_result("order_id", "{{Step1_Service2.order_id}}") // Pass result from previous step
+                .build())
+            .add()
+        .step("Step2_Service3")
+            .service("Service3")
+            .execute("Service3.s3.exec", MessageTemplateBuilder::new()
+                .field("data", "Hello from S3")
+                .from_result("received_order_id", "{{Step1_Service2.order_id}}") // Use result from Step1
+                .build())
+            .compensate("Service3.s3.comp", MessageTemplateBuilder::new()
+                .field("data", "Undo S3")
+                .from_result("order_id", "{{Step1_Service2.order_id}}") // Use result from Step1 for compensation
+                .build())
+            .add()
+        .build();
 
-    // Use the high-level API to submit the saga
     client.submit_saga(recipe).await?;
+
+    // Keep connection open briefly to ensure message is sent/received
+    sleep(Duration::from_millis(100)).await;
 
     Ok(())
 }
@@ -94,49 +169,45 @@ async fn trigger_saga(skald_addr: SocketAddr) -> Result<()> {
 // --- Test ---
 
 #[tokio::test]
-async fn test_central_orchestration_with_clean_api() -> Result<()> {
+async fn test_central_orchestration_with_client_handlers() -> Result<()> {
     let execution_log = Arc::new(Mutex::new(Vec::new()));
 
-    // 1. Start Skald Server (The Orchestrator)
-    let skald_port = 9091; // Use a different port to avoid conflicts
+    // 1. Start Skald Server
+    let skald_port = 9093; // Use a different port
     let skald_addr: SocketAddr = format!("127.0.0.1:{}", skald_port).parse()?;
     let skald_server = Arc::new(SkaldServer::new());
 
     let server_clone = skald_server.clone();
     tokio::spawn(async move {
         let listener = TcpTransportListener::bind(skald_addr).await.unwrap();
-        // The listen loop now handles registration internally
         server_clone.listen(Box::new(listener)).await.unwrap();
-    });
-    let server_run = skald_server.clone();
-    tokio::spawn(async move {
-        // The run loop now handles saga submissions internally
-        server_run.run().await;
     });
 
     sleep(Duration::from_millis(100)).await;
 
-    // 2. Start Service 2 and Service 3
+    // 2. Start Service Nodes
     start_service_node("Service2".to_string(), skald_addr, execution_log.clone()).await?;
     start_service_node("Service3".to_string(), skald_addr, execution_log.clone()).await?;
 
     sleep(Duration::from_millis(100)).await;
 
-    // 3. Trigger the Saga via a client
+    // 3. Trigger the Saga
     trigger_saga(skald_addr).await?;
 
-    // 4. Wait for execution
+    // 4. Wait for execution to complete
     sleep(Duration::from_millis(500)).await;
 
-    // 5. Verify Log
+    // 5. Verify the execution log
     let log = execution_log.lock().unwrap();
     println!("Execution Log: {:?}", log);
 
-    assert!(log.iter().any(|s| s.contains("Service2: Received s2.exec")));
-    assert!(log.iter().any(|s| s.contains("Service3: Received s3.exec")));
+    // Verify Step1 execution and its result passing
+    let s2_exec_log = log.iter().find(|s| s.contains("Service2: Received s2.exec with initial_id 101")).expect("Service2 s2.exec not found");
+    assert!(s2_exec_log.contains("returning order_id order-101"));
 
-    // We can't easily check for "Saga Completed" in the shared log because that logic is now internal to the server.
-    // But we can see the effects (the service logs). This is a more realistic integration test.
+    // Verify Step2 execution and that it received the order_id from Step1
+    let s3_exec_log = log.iter().find(|s| s.contains("Service3: Received s3.exec with data 'Hello from S3'")).expect("Service3 s3.exec not found");
+    assert!(s3_exec_log.contains("and order_id 'order-101'"));
 
     Ok(())
 }
